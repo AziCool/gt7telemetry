@@ -3,40 +3,78 @@ from datetime import datetime as dt
 from datetime import timedelta as td
 import socket
 import sys
+import argparse
 import struct
+import os
+import csv
 from Crypto.Cipher import Salsa20
+import io
+import urllib.request
+from typing import Dict, Iterable, Optional
 
 # ansi prefix
-pref = "\033["
+ANSIPREF = "\033["
+COLOR_MAP = {
+		'black':30,'red':31,'green':32,'yellow':33,'blue':34,'magenta':35,'cyan':36,'white':37,
+		'bright_black':90,'bright_red':91,'bright_green':92,'bright_yellow':93,'bright_blue':94,
+		'bright_magenta':95,'bright_cyan':96,'bright_white':97
+	}
+# default foreground color for all `printAt` calls (set to 'green' to enable green UI)
+fg_color ='white'
 
 # ports for send and receive data
-SendPort = 33739
-ReceivePort = 33740
+SENDPORT = 33739
+RECEIVEPORT = 33740
 
 # ctrl-c handler
 def handler(signum, frame):
-	sys.stdout.write(f'{pref}?1049l')	# revert buffer
-	sys.stdout.write(f'{pref}?25h')		# restore cursor
-	sys.stdout.flush()
-	exit(1)
+    # restore terminal only when stdout is a tty
+    if sys.stdout.isatty():
+        sys.stdout.write(f'{ANSIPREF}?1049l')  # revert buffer
+        sys.stdout.write(f'{ANSIPREF}?25h')    # restore cursor
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+    sys.exit(1)
 
+#################################
 # handle ctrl-c
+#################################
 signal.signal(signal.SIGINT, handler)
-
-sys.stdout.write(f'{pref}?1049h')	# alt buffer
-sys.stdout.write(f'{pref}?25l')		# hide cursor
+sys.stdout.write(f'{ANSIPREF}?1049h')	# alt buffer
+sys.stdout.write(f'{ANSIPREF}?25l')		# hide cursor
 sys.stdout.flush()
 
-# get ip address from command line
-if len(sys.argv) == 2:
-    ip = sys.argv[1]
-else:
-    print('Run like : python3 gt7telemetry.py <playstation-ip>')
-    exit(1)
+#################################
+# get ip address from command line (supports optional --color)
+#################################
+parser = argparse.ArgumentParser(description='GT7 telemetry display')
+parser.add_argument('ip', help='PlayStation IP address')
+parser.add_argument('--color', help='Output foreground color name (e.g. green). Use "none" or omit for default.', default=None)
 
+
+try : 
+	args = parser.parse_args()
+except SystemExit as e:
+	print('Run like : python3 gt7telemetry.py <playstation-ip>')
+	print('Optional: --color <colorname> --color <colorname> (e.g. green)')
+	print('Available colors: {}'.format(', '.join(COLOR_MAP.keys())))
+	exit(1)
+
+ip = args.ip
+if len(ip) == 0:
+	print('Run like : python3 gt7telemetry.py <playstation-ip>')
+	exit(1)
+if args.color and args.color.lower() != 'none':
+	fg_color = args.color.lower()
+
+
+#################################
 # Create a UDP socket and bind it
+#################################
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.bind(('0.0.0.0', ReceivePort))
+s.bind(('0.0.0.0', RECEIVEPORT))
 s.settimeout(10)
 
 # data stream decoding
@@ -62,21 +100,34 @@ def salsa20_dec(dat):
 # send heartbeat
 def send_hb(s):
 	send_data = 'A'
-	s.sendto(send_data.encode('utf-8'), (ip, SendPort))
+	s.sendto(send_data.encode('utf-8'), (ip, SENDPORT))
 	#print('send heartbeat')
 
-# generic print function
-def printAt(str, row=1, column=1, bold=0, underline=0, reverse=0):
-	sys.stdout.write('{}{};{}H'.format(pref, row, column))
+# generic print function (supports optional fg/bg colors)
+def printAt(str, row=1, column=1, bold=0, underline=0, reverse=0, fg=fg_color, bg=None):
+	sys.stdout.write('{}{};{}H'.format(ANSIPREF, row, column))
+	 	
 	if reverse:
-		sys.stdout.write('{}7m'.format(pref))
+		sys.stdout.write('{}7m'.format(ANSIPREF))
 	if bold:
-		sys.stdout.write('{}1m'.format(pref))
+		sys.stdout.write('{}1m'.format(ANSIPREF))
 	if underline:
-		sys.stdout.write('{}4m'.format(pref))
-	if not bold and not underline and not reverse:
-		sys.stdout.write('{}0m'.format(pref))
+		sys.stdout.write('{}4m'.format(ANSIPREF))
+ 	
+	# effective foreground: explicit fg overrides DEFAULT_FG	
+	code = None
+	try:		
+		code = COLOR_MAP.get(fg, None)
+		if code is not None:
+			##### Foreground color  ####
+			sys.stdout.write('{}{}m'.format(ANSIPREF, code))
+			
+	except Exception:
+		code = None
+
 	sys.stdout.write(str)
+	sys.stdout.write('{}0m'.format(ANSIPREF))
+	
 
 def secondsToLaptime(seconds):
 	remaining = seconds
@@ -85,9 +136,77 @@ def secondsToLaptime(seconds):
 	return '{:01.0f}:{:06.3f}'.format(minutes, remaining)
 
 
+def load_car_map(
+    local_paths: Optional[Iterable[str]] = None,
+    raw_url: str = "https://raw.githubusercontent.com/ddm999/gt7info/web-new/_data/db/cars.csv",
+    timeout_s: float = 10.0,
+    cache_to: Optional[str] = None,
+) -> Dict[int, str]:
+    
+	# Default: try first next to this file, then cwd.
+    if local_paths is None:
+        here = os.path.dirname(__file__) if "__file__" in globals() else os.getcwd()
+        local_paths = [os.path.join(here, "cars.csv"), "cars.csv"]
+
+    def parse_csv_text(text: str) -> Dict[int, str]:
+        out: Dict[int, str] = {}
+        reader = csv.reader(io.StringIO(text))
+        for row in reader:
+            if not row:
+                continue
+            
+			# Skip non-numeric header lines
+            try:
+                cid = int(str(row[0]).strip())
+            except Exception:
+                continue
+            name = str(row[1]).strip() if len(row) > 1 else ""
+            out[cid] = name
+        return out
+
+	# 1) Try local paths first: do not download until all local options are exhausted.
+    for p in local_paths:
+        try:
+            if p and os.path.exists(p):
+                with open(p, "r", encoding="utf-8", newline="") as fh:
+                    text = fh.read()
+                car_map = parse_csv_text(text)
+                if car_map:
+                    return car_map
+				# If the file exists but is empty/invalid, continue.
+        except Exception:
+            # best-effort
+            continue
+    
+	# Fallback to remote URL if local files not found
+    try:
+        with urllib.request.urlopen(raw_url, timeout=timeout_s) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+        car_map = parse_csv_text(text)
+        if not car_map:
+            return {}
+
+        # 3) local Cache (optionnal)
+        try:
+            target = cache_to
+            if not target:
+                here = os.path.dirname(__file__) if "__file__" in globals() else os.getcwd()
+                target = os.path.join(here, "cars.csv")
+            with open(target, "w", encoding="utf-8", newline="") as fh:
+                fh.write(text)
+        except Exception:
+            pass
+
+        return car_map
+    except Exception as e:
+        printAt('Exception: {}'.format(e), 41, 1, reverse=1)
+        return {}
 
 # start by sending heartbeat
 send_hb(s)
+
+# load car name mapping (local `cars.csv` if present, otherwise fetch from GitHub)
+car_map = load_car_map()
 
 printAt('GT7 Telemetry Display 0.7 (ctrl-c to quit)', 1, 1, bold=1)
 printAt('Packet ID:', 1, 73)
@@ -101,7 +220,7 @@ printAt('Current Lap Time: ', 7, 31)
 printAt('Last Lap Time:', 8, 1)
 
 printAt('{:<92}'.format('Current Car Data'), 10, 1, reverse=1, bold=1)
-printAt('Car ID:', 10, 41, reverse=1)
+printAt('Car :', 10, 41, reverse=1)
 printAt('Throttle:    %', 12, 1)
 printAt('RPM:        rpm', 12, 21)
 printAt('Speed:        kph', 12, 41)
@@ -256,9 +375,15 @@ while True:
 				printAt('{:>9}'.format(secondsToLaptime(lstlap / 1000)), 8, 16)		# last lap time
 			else:
 				printAt('{:>9}'.format(''), 8, 16)
-
-			printAt('{:5.0f}'.format(struct.unpack('i', ddata[0x124:0x124+4])[0]), 10, 48, reverse=1)		# car id
-
+			# print car *name* by looking up numeric ID in cars.csv (local or remote fallback)
+			car_id = struct.unpack('i', ddata[0x124:0x124+4])[0]
+			car_name = car_map.get(car_id)
+			if car_name:
+				# keep UI width reasonable — truncate to 20 chars
+				printAt('{:<20}'.format(car_name[:20]), 10, 48, reverse=1)
+			else:
+				printAt('{:5.0f}'.format(car_id), 10, 48, reverse=1)
+			
 			printAt('{:3.0f}'.format(struct.unpack('B', ddata[0x91:0x91+1])[0] / 2.55), 12, 11)				# throttle
 			printAt('{:7.0f}'.format(struct.unpack('f', ddata[0x3C:0x3C+4])[0]), 12, 25)					# rpm
 			printAt('{:7.1f}'.format(carSpeed), 12, 47)														# speed kph
